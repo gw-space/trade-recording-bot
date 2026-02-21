@@ -169,34 +169,8 @@ LOC 큰수 : ...
 
 업비트 명령은 요약이 함께 회신됩니다.
 
-## 10) 백업
+## 10) 자동 백업
 
 - 기입 전에 대상 스프레드시트를 XLSX로 백업
 - 기본 경로: `/Users/test/AIassistant/spreadsheet_backups`
 - 환경변수: `SPREADSHEET_BACKUP_DIR`
-
-## 11) 확장 구조
-
-코드는 `공통 엔진 + 전략(Strategy)` 구조입니다.
-
-- 공통 엔진: 업데이트 수신, 컨텍스트 생성, 전략 디스패치
-- 전략 핸들러: 업비트 명령 처리, 메리츠 메시지 처리
-
-새 루틴 추가:
-1. `handle_xxx_strategy(ctx)` 작성
-2. 판별/기입/응답 로직 구현
-3. `build_strategies()`에 등록
-
-## 12) 트러블슈팅
-
-`401 Unauthorized`:
-- 업비트 키/시크릿/허용 IP/권한 확인
-
-`403` Google API:
-- Google Sheets API, Google Drive API 활성화
-- 서비스계정 공유 권한 확인
-
-기입 0건:
-- 명령 날짜/형식 확인
-- 매핑(`SPREADSHEET_ID_MAP`, `UPBIT_MARKET_SHEET_MAP`) 확인
-- 로그(`upbit_fetch_done`, `upbit_sheet_write`) 확인
