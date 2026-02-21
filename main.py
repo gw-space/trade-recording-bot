@@ -880,7 +880,6 @@ def main() -> None:
 
     while True:
         try:
-            log(f"poll_wait offset={offset}")
             updates = fetch_updates(token, offset, poll_timeout)
             if updates:
                 log(f"updates_received count={len(updates)}")
