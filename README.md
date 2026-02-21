@@ -1,5 +1,8 @@
 # Telegram + Upbit + Google Sheets Auto Fill
 
+라오어의 무한매수법을 위한 구글스프레드시트 자동기입 봇입니다.
+적용되는 구글스프레드시트 템플릿 파일은 `spreadsheet_template.xlsx` 입니다.
+
 이 프로그램은 텔레그램 메시지를 입력 채널로 사용해, 체결 내역을 Google 스프레드시트에 자동 기록하고 결과를 다시 텔레그램으로 회신합니다.
 
 - 메리츠 체결 안내 메시지 파싱 -> TQQQ 시트 기록
