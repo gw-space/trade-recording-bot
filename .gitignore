@@ -1,6 +1,7 @@
 # Secrets / credentials
 .env
 service_account.json
+spreadsheet_map.json
 
 # Keep template env
 !.env.example

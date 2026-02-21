@@ -10,7 +10,7 @@ import warnings
 from dataclasses import dataclass
 from datetime import date, datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 from urllib.parse import unquote, urlencode
 from zoneinfo import ZoneInfo
 
@@ -70,6 +70,41 @@ class UpbitFill:
     price: float
     qty: float
     amount: float
+
+
+@dataclass
+class AppConfig:
+    tz_name: str
+    token: str
+    sa_file: str
+    worksheet_name: str
+    poll_timeout: int
+    poll_interval: int
+    state_file: Path
+    start_latest_first: bool
+    upbit_enabled: bool
+    upbit_access_key: str
+    upbit_secret_key: str
+    upbit_market_sheet_map: Dict[str, str]
+    upbit_base_url: str
+    upbit_orders_path: str
+    upbit_command_prefix: str
+    backup_dir: str
+    spreadsheet_id_map: Dict[str, str]
+
+
+@dataclass
+class UpdateContext:
+    update_id: int
+    text: str
+    chat_id: Optional[int]
+    gc: gspread.Client
+    state: Dict
+    cfg: AppConfig
+    backup_cache: set
+
+
+StrategyHandler = Callable[[UpdateContext], bool]
 
 
 def log(msg: str) -> None:
@@ -243,6 +278,41 @@ def parse_spreadsheet_id_map(raw: str) -> Dict[str, str]:
     return out
 
 
+def parse_upbit_market_sheet_map(raw: str) -> Dict[str, str]:
+    # format: KRW-BTC:BTC,KRW-ETH:ETH
+    out: Dict[str, str] = {}
+    for item in raw.split(","):
+        pair = item.strip()
+        if not pair or ":" not in pair:
+            continue
+        market, symbol = pair.split(":", 1)
+        market = market.strip().upper()
+        symbol = symbol.strip().upper()
+        if market and symbol:
+            out[market] = symbol
+    return out
+
+
+def load_spreadsheet_id_map_from_file(path_text: str) -> Dict[str, str]:
+    path = Path(path_text).expanduser()
+    if not path.exists():
+        raise ValueError(f"SPREADSHEET_ID_MAP_FILE not found: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise ValueError(f"invalid JSON in SPREADSHEET_ID_MAP_FILE: {path}") from e
+    if not isinstance(raw, dict):
+        raise ValueError(f"SPREADSHEET_ID_MAP_FILE must be a JSON object: {path}")
+
+    out: Dict[str, str] = {}
+    for k, v in raw.items():
+        symbol = str(k).strip().upper()
+        sheet_id = str(v).strip()
+        if symbol and sheet_id:
+            out[symbol] = sheet_id
+    return out
+
+
 def get_fill_result_for_row(
     ws: gspread.Worksheet, sh_title: str, target_row: int, total_qty_col: int, symbol_hint: str = ""
 ) -> FillResult:
@@ -290,18 +360,29 @@ def build_upbit_command_result_text(processed_count: int, written_count: int, re
     )
 
 
-def parse_upbit_command_date(text: str, command_text: str, tz_name: str) -> Optional[Tuple[date, bool]]:
-    pattern = rf"^\s*{re.escape(command_text)}(?:\s*:\s*(\d{{2,4}}-\d{{2}}-\d{{2}}))?\s*$"
+def parse_upbit_symbol_command(
+    text: str,
+    command_prefix: str,
+    tz_name: str,
+) -> Optional[Tuple[str, date, bool]]:
+    # Examples:
+    # - 업비트 BTC 기록
+    # - 업비트 BTC 기록 : 2026-02-20
+    pattern = (
+        rf"^\s*{re.escape(command_prefix)}\s+([A-Za-z0-9_-]+)\s+기록"
+        rf"(?:\s*:\s*(\d{{2,4}}-\d{{2}}-\d{{2}}))?\s*$"
+    )
     m = re.match(pattern, text.strip())
     if not m:
         return None
-    d = m.group(1)
+    symbol = m.group(1).strip().upper()
+    d = m.group(2)
     if not d:
-        return datetime.now(ZoneInfo(tz_name)).date(), False
+        return symbol, datetime.now(ZoneInfo(tz_name)).date(), False
     if len(d.split("-", 1)[0]) == 2:
         yy, mm, dd = d.split("-")
         d = f"20{yy}-{mm}-{dd}"
-    return datetime.strptime(d, "%Y-%m-%d").date(), True
+    return symbol, datetime.strptime(d, "%Y-%m-%d").date(), True
 
 
 def upbit_auth_headers(access_key: str, secret_key: str, params: Dict[str, str]) -> Dict[str, str]:
@@ -322,8 +403,7 @@ def fetch_upbit_fills_for_date(
     target_date: date,
     access_key: str,
     secret_key: str,
-    market_filter: str,
-    market_asset_filter: str,
+    market_filter: str = "",
     base_url: str = "https://api.upbit.com",
     orders_path: str = "/v1/orders/closed",
 ) -> List[UpbitFill]:
@@ -374,19 +454,12 @@ def fetch_upbit_fills_for_date(
                 skip_date += 1
                 continue
             market = str(row.get("market", ""))
-            base_asset = market.split("-")[-1].upper() if "-" in market else market.upper()
-            # Enforce BTC-only handling regardless of external config.
-            if base_asset != "BTC":
+            if not market:
                 skip_market += 1
                 continue
-            if market_filter and market != market_filter:
-                if market_asset_filter:
-                    if base_asset != market_asset_filter.upper():
-                        skip_market += 1
-                        continue
-                else:
-                    skip_market += 1
-                    continue
+            if market_filter and market.upper() != market_filter.upper():
+                skip_market += 1
+                continue
             side = str(row.get("side", ""))
             # Enforce buy-only handling.
             if side != "bid":
@@ -427,17 +500,15 @@ def fetch_upbit_fills_for_date(
             )
         page += 1
     log(
-        f"upbit_fetch_done target_date={target_date.isoformat()} market={market_filter} asset={market_asset_filter} "
+        f"upbit_fetch_done target_date={target_date.isoformat()} market={market_filter} "
         f"rows={total_rows} fills={len(out)} skip_date={skip_date} "
         f"skip_market={skip_market} skip_side={skip_side} skip_qty={skip_qty} skip_amount={skip_amount} pages={page-1}"
     )
     return out
 
 
-def resolve_spreadsheet(gc: gspread.Client, symbol: str):
-    raw_map = os.getenv("SPREADSHEET_ID_MAP", "").strip()
-    id_map = parse_spreadsheet_id_map(raw_map)
-    sheet_id = id_map.get(symbol)
+def resolve_spreadsheet(gc: gspread.Client, symbol: str, spreadsheet_id_map: Dict[str, str]):
+    sheet_id = spreadsheet_id_map.get(symbol.upper())
     if sheet_id:
         return gc.open_by_key(sheet_id)
 
@@ -446,7 +517,8 @@ def resolve_spreadsheet(gc: gspread.Client, symbol: str):
         return gc.open(f"{symbol} 무한매수")
 
     raise ValueError(
-        f"SPREADSHEET_ID_MAP에 {symbol} 키가 없습니다. 예: SPREADSHEET_ID_MAP=TQQQ:<spreadsheet_id>"
+        f"스프레드시트 매핑에 {symbol} 키가 없습니다. "
+        "SPREADSHEET_ID_MAP 또는 SPREADSHEET_ID_MAP_FILE(JSON) 설정을 확인하세요."
     )
 
 
@@ -612,6 +684,7 @@ def process_fill_to_sheet(
     msg: FillMessage,
     tz_name: str,
     worksheet_name: str,
+    spreadsheet_id_map: Dict[str, str],
     backup_dir: str,
     backup_cache: set,
     backup_context: str,
@@ -621,7 +694,7 @@ def process_fill_to_sheet(
     if msg.fill_qty < 0:
         return None
 
-    sh = resolve_spreadsheet(gc, msg.symbol)
+    sh = resolve_spreadsheet(gc, msg.symbol, spreadsheet_id_map)
     ensure_spreadsheet_backup_once(sh, backup_dir, backup_cache, backup_context, msg.symbol)
     ws = sh.worksheet(worksheet_name) if worksheet_name else sh.get_worksheet(0)
 
@@ -660,13 +733,14 @@ def process_upbit_fill_to_sheet(
     worksheet_name: str,
     target_symbol: str,
     fill: UpbitFill,
+    spreadsheet_id_map: Dict[str, str],
     backup_dir: str,
     backup_cache: set,
     backup_context: str,
 ) -> Optional[FillResult]:
     if fill.side != "bid":
         return None
-    sh = resolve_spreadsheet(gc, target_symbol)
+    sh = resolve_spreadsheet(gc, target_symbol, spreadsheet_id_map)
     ensure_spreadsheet_backup_once(sh, backup_dir, backup_cache, backup_context, target_symbol)
     ws = sh.worksheet(worksheet_name) if worksheet_name else sh.get_worksheet(0)
     values = ws.get_all_values()
@@ -718,7 +792,10 @@ def process_upbit_fill_to_sheet(
         )
         return None
 
-    return get_fill_result_for_row(ws, sh.title, target_row, total_qty_col, target_symbol)
+    result = get_fill_result_for_row(ws, sh.title, target_row, total_qty_col, target_symbol)
+    # Upbit sync in this bot assumes KRW market fills.
+    result.currency = "KRW"
+    return result
 
 
 def run_upbit_sync_once(
@@ -730,11 +807,11 @@ def run_upbit_sync_once(
     upbit_access_key: str,
     upbit_secret_key: str,
     upbit_market: str,
-    upbit_market_asset: str,
     upbit_sheet_symbol: str,
     upbit_base_url: str,
     upbit_orders_path: str,
     explicit_date: bool,
+    spreadsheet_id_map: Dict[str, str],
     backup_dir: str,
     backup_cache: set,
     backup_context: str,
@@ -745,14 +822,14 @@ def run_upbit_sync_once(
         access_key=upbit_access_key,
         secret_key=upbit_secret_key,
         market_filter=upbit_market,
-        market_asset_filter=upbit_market_asset,
         base_url=upbit_base_url,
         orders_path=upbit_orders_path,
     )
     processed_ids = set(state.get("processed_upbit_fill_ids", []))
     new_fills = fills if explicit_date else [f for f in fills if f.fill_id not in processed_ids]
     if new_fills:
-        log(f"upbit_manual_sync_new_fills count={len(new_fills)} market={upbit_market}")
+        markets = sorted({f.market for f in new_fills})
+        log(f"upbit_manual_sync_new_fills count={len(new_fills)} markets={markets}")
 
     processed_count = 0
     written_count = 0
@@ -765,6 +842,7 @@ def run_upbit_sync_once(
             worksheet_name=worksheet_name,
             target_symbol=upbit_sheet_symbol,
             fill=fill,
+            spreadsheet_id_map=spreadsheet_id_map,
             backup_dir=backup_dir,
             backup_cache=backup_cache,
             backup_context=backup_context,
@@ -831,9 +909,7 @@ def send_telegram_message(token: str, chat_id: int, text: str) -> None:
     log(f"telegram_reply_sent chat_id={chat_id}")
 
 
-def main() -> None:
-    load_dotenv()
-
+def build_app_config() -> AppConfig:
     tz_name = os.getenv("TIMEZONE", "Asia/Seoul")
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     sa_file = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
@@ -847,40 +923,180 @@ def main() -> None:
         "yes",
         "on",
     }
-
-    if not token:
-        raise ValueError("TELEGRAM_BOT_TOKEN is required")
-    if not sa_file:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE is required")
-
     upbit_enabled = os.getenv("UPBIT_ENABLED", "false").lower().strip() in {"1", "true", "yes", "on"}
     upbit_access_key = os.getenv("UPBIT_ACCESS_KEY", "").strip()
     upbit_secret_key = os.getenv("UPBIT_SECRET_KEY", "").strip()
     upbit_market = os.getenv("UPBIT_MARKET", "KRW-BTC").strip()
-    upbit_market_asset = os.getenv("UPBIT_MARKET_ASSET", "BTC").strip().upper()
     upbit_sheet_symbol = os.getenv("UPBIT_SHEET_SYMBOL", "BTC").strip().upper()
+    upbit_market_sheet_map = parse_upbit_market_sheet_map(os.getenv("UPBIT_MARKET_SHEET_MAP", "").strip())
+    if not upbit_market_sheet_map and upbit_market and upbit_sheet_symbol:
+        # Backward compatibility with legacy single-market settings.
+        upbit_market_sheet_map = {upbit_market.upper(): upbit_sheet_symbol}
     upbit_base_url = os.getenv("UPBIT_BASE_URL", "https://api.upbit.com").strip()
     upbit_orders_path = os.getenv("UPBIT_ORDERS_PATH", "/v1/orders").strip()
-    upbit_command_text = os.getenv("UPBIT_COMMAND_TEXT", "업비트 기록 수행").strip()
+    upbit_command_prefix = os.getenv("UPBIT_COMMAND_PREFIX", "업비트").strip()
     backup_dir = os.getenv("SPREADSHEET_BACKUP_DIR", "/Users/test/AIassistant/spreadsheet_backups").strip()
+    spreadsheet_id_map = parse_spreadsheet_id_map(os.getenv("SPREADSHEET_ID_MAP", "").strip())
+    spreadsheet_id_map_file = os.getenv("SPREADSHEET_ID_MAP_FILE", "").strip()
+    if spreadsheet_id_map_file:
+        spreadsheet_id_map.update(load_spreadsheet_id_map_from_file(spreadsheet_id_map_file))
+
+    return AppConfig(
+        tz_name=tz_name,
+        token=token,
+        sa_file=sa_file,
+        worksheet_name=worksheet_name,
+        poll_timeout=poll_timeout,
+        poll_interval=poll_interval,
+        state_file=state_file,
+        start_latest_first=start_latest_first,
+        upbit_enabled=upbit_enabled,
+        upbit_access_key=upbit_access_key,
+        upbit_secret_key=upbit_secret_key,
+        upbit_market_sheet_map=upbit_market_sheet_map,
+        upbit_base_url=upbit_base_url,
+        upbit_orders_path=upbit_orders_path,
+        upbit_command_prefix=upbit_command_prefix,
+        backup_dir=backup_dir,
+        spreadsheet_id_map=spreadsheet_id_map,
+    )
+
+
+def handle_upbit_command_strategy(ctx: UpdateContext) -> bool:
+    cmd_parsed = parse_upbit_symbol_command(ctx.text, ctx.cfg.upbit_command_prefix, ctx.cfg.tz_name)
+    if cmd_parsed is None:
+        return False
+
+    target_symbol, cmd_date, explicit_date = cmd_parsed
+    if not ctx.cfg.upbit_enabled:
+        if ctx.chat_id is not None:
+            send_telegram_message(
+                ctx.cfg.token,
+                ctx.chat_id,
+                "업비트 기능이 비활성화되어 있습니다. (UPBIT_ENABLED=false)",
+            )
+        log("upbit_command_ignored_disabled")
+        return True
+
+    if not ctx.cfg.upbit_access_key or not ctx.cfg.upbit_secret_key:
+        if ctx.chat_id is not None:
+            send_telegram_message(ctx.cfg.token, ctx.chat_id, "업비트 API 키가 설정되지 않았습니다.")
+        log("upbit_command_ignored_missing_keys")
+        return True
+    if not ctx.cfg.upbit_market_sheet_map:
+        if ctx.chat_id is not None:
+            send_telegram_message(
+                ctx.cfg.token,
+                ctx.chat_id,
+                "업비트 마켓 매핑이 비어 있습니다. UPBIT_MARKET_SHEET_MAP을 설정하세요.",
+            )
+        log("upbit_command_ignored_missing_market_sheet_map")
+        return True
+    symbol_market_map = {v.upper(): k.upper() for k, v in ctx.cfg.upbit_market_sheet_map.items()}
+    target_market = symbol_market_map.get(target_symbol.upper())
+    if not target_market:
+        allowed_symbols = sorted(symbol_market_map.keys())
+        if ctx.chat_id is not None:
+            send_telegram_message(
+                ctx.cfg.token,
+                ctx.chat_id,
+                f"지원하지 않는 코인 심볼입니다: {target_symbol}\n지원 심볼: {', '.join(allowed_symbols)}",
+            )
+        log(f"upbit_command_ignored_unknown_symbol symbol={target_symbol}")
+        return True
+
+    processed_count, written_count, last_result = run_upbit_sync_once(
+        gc=ctx.gc,
+        state=ctx.state,
+        tz_name=ctx.cfg.tz_name,
+        target_date=cmd_date,
+        worksheet_name=ctx.cfg.worksheet_name,
+        upbit_access_key=ctx.cfg.upbit_access_key,
+        upbit_secret_key=ctx.cfg.upbit_secret_key,
+        upbit_market=target_market,
+        upbit_sheet_symbol=target_symbol,
+        upbit_base_url=ctx.cfg.upbit_base_url,
+        upbit_orders_path=ctx.cfg.upbit_orders_path,
+        explicit_date=explicit_date,
+        spreadsheet_id_map=ctx.cfg.spreadsheet_id_map,
+        backup_dir=ctx.cfg.backup_dir,
+        backup_cache=ctx.backup_cache,
+        backup_context=f"upbit_update_{ctx.update_id}_{cmd_date.isoformat()}",
+    )
+    save_state(ctx.cfg.state_file, ctx.state)
+    if ctx.chat_id is not None:
+        send_telegram_message(
+            ctx.cfg.token,
+            ctx.chat_id,
+            build_upbit_command_result_text(processed_count, written_count, last_result),
+        )
+    log(f"upbit_command_done date={cmd_date.isoformat()} processed={processed_count} written={written_count}")
+    return True
+
+
+def handle_meritz_message_strategy(ctx: UpdateContext) -> bool:
+    msg = parse_fill_message(ctx.text, ctx.cfg.tz_name)
+    if not msg:
+        return False
+    log(
+        f"fill_message_parsed update_id={ctx.update_id} symbol={msg.symbol} "
+        f"side={msg.trade_side} price={msg.fill_price} qty={msg.fill_qty}"
+    )
+    result = process_fill_to_sheet(
+        ctx.gc,
+        msg,
+        ctx.cfg.tz_name,
+        ctx.cfg.worksheet_name,
+        ctx.cfg.spreadsheet_id_map,
+        backup_dir=ctx.cfg.backup_dir,
+        backup_cache=ctx.backup_cache,
+        backup_context=f"meritz_update_{ctx.update_id}",
+    )
+    if result and ctx.chat_id is not None:
+        send_telegram_message(ctx.cfg.token, ctx.chat_id, build_reply_text(result))
+    log(f"processed update_id={ctx.update_id} symbol={msg.symbol}")
+    return True
+
+
+def build_strategies() -> List[StrategyHandler]:
+    # First-match-wins pipeline. Add new asset handlers here.
+    return [handle_upbit_command_strategy, handle_meritz_message_strategy]
+
+
+def dispatch_update(ctx: UpdateContext, strategies: List[StrategyHandler]) -> bool:
+    for strategy in strategies:
+        if strategy(ctx):
+            return True
+    return False
+
+
+def main() -> None:
+    load_dotenv()
+    cfg = build_app_config()
+
+    if not cfg.token:
+        raise ValueError("TELEGRAM_BOT_TOKEN is required")
+    if not cfg.sa_file:
+        raise ValueError("GOOGLE_SERVICE_ACCOUNT_FILE is required")
 
     log("bot_start")
-    gc = gspread.service_account(filename=sa_file)
-    has_state = state_file.exists()
-    state = load_state(state_file)
+    gc = gspread.service_account(filename=cfg.sa_file)
+    strategies = build_strategies()
+    has_state = cfg.state_file.exists()
+    state = load_state(cfg.state_file)
     offset = int(state.get("last_update_id", 0)) + 1
 
-    if (not has_state) and start_latest_first:
-        warmup = fetch_updates(token, 0, 0)
+    if (not has_state) and cfg.start_latest_first:
+        warmup = fetch_updates(cfg.token, 0, 0)
         if warmup:
             offset = max(int(x["update_id"]) for x in warmup) + 1
             state["last_update_id"] = offset - 1
-            save_state(state_file, state)
+            save_state(cfg.state_file, state)
             log(f"warmup_skip_old_updates count={len(warmup)} offset={offset}")
 
     while True:
         try:
-            updates = fetch_updates(token, offset, poll_timeout)
+            updates = fetch_updates(cfg.token, offset, cfg.poll_timeout)
             if updates:
                 log(f"updates_received count={len(updates)}")
             for upd in updates:
@@ -893,69 +1109,19 @@ def main() -> None:
                         chat_id = get_update_chat_id(upd)
                         if chat_id is not None:
                             state["default_chat_id"] = int(chat_id)
-
-                        cmd_parsed = parse_upbit_command_date(text, upbit_command_text, tz_name)
-                        if cmd_parsed is not None:
-                            cmd_date, explicit_date = cmd_parsed
-                            if not upbit_enabled:
-                                if chat_id is not None:
-                                    send_telegram_message(token, chat_id, "업비트 기능이 비활성화되어 있습니다. (UPBIT_ENABLED=false)")
-                                log("upbit_command_ignored_disabled")
-                            elif not upbit_access_key or not upbit_secret_key:
-                                if chat_id is not None:
-                                    send_telegram_message(token, chat_id, "업비트 API 키가 설정되지 않았습니다.")
-                                log("upbit_command_ignored_missing_keys")
-                            else:
-                                processed_count, written_count, last_result = run_upbit_sync_once(
-                                    gc=gc,
-                                    state=state,
-                                    tz_name=tz_name,
-                                    target_date=cmd_date,
-                                    worksheet_name=worksheet_name,
-                                    upbit_access_key=upbit_access_key,
-                                    upbit_secret_key=upbit_secret_key,
-                                    upbit_market=upbit_market,
-                                    upbit_market_asset=upbit_market_asset,
-                                    upbit_sheet_symbol=upbit_sheet_symbol,
-                                    upbit_base_url=upbit_base_url,
-                                    upbit_orders_path=upbit_orders_path,
-                                    explicit_date=explicit_date,
-                                    backup_dir=backup_dir,
-                                    backup_cache=backup_cache,
-                                    backup_context=f"upbit_update_{upd_id}_{cmd_date.isoformat()}",
-                                )
-                                save_state(state_file, state)
-                                if chat_id is not None:
-                                    send_telegram_message(
-                                        token,
-                                        chat_id,
-                                        build_upbit_command_result_text(processed_count, written_count, last_result),
-                                    )
-                                log(
-                                    f"upbit_command_done date={cmd_date.isoformat()} processed={processed_count} written={written_count}"
-                                )
+                        ctx = UpdateContext(
+                            update_id=upd_id,
+                            text=text,
+                            chat_id=chat_id,
+                            gc=gc,
+                            state=state,
+                            cfg=cfg,
+                            backup_cache=backup_cache,
+                        )
+                        handled = dispatch_update(ctx, strategies)
+                        if handled:
                             offset = max(offset, upd_id + 1)
                             continue
-
-                        msg = parse_fill_message(text, tz_name)
-                        if msg:
-                            log(
-                                f"fill_message_parsed update_id={upd_id} symbol={msg.symbol} "
-                                f"side={msg.trade_side} price={msg.fill_price} qty={msg.fill_qty}"
-                            )
-                            result = process_fill_to_sheet(
-                                gc,
-                                msg,
-                                tz_name,
-                                worksheet_name,
-                                backup_dir=backup_dir,
-                                backup_cache=backup_cache,
-                                backup_context=f"meritz_update_{upd_id}",
-                            )
-                            if result:
-                                if chat_id is not None:
-                                    send_telegram_message(token, chat_id, build_reply_text(result))
-                            log(f"processed update_id={upd_id} symbol={msg.symbol}")
                 except Exception as per_update_error:
                     log(
                         f"error(update_id={upd_id}): "
@@ -965,13 +1131,13 @@ def main() -> None:
                 offset = max(offset, upd_id + 1)
 
             state["last_update_id"] = offset - 1
-            save_state(state_file, state)
+            save_state(cfg.state_file, state)
         except Exception as e:
             log(f"error: {e}")
-            time.sleep(max(3, poll_interval))
+            time.sleep(max(3, cfg.poll_interval))
             continue
 
-        time.sleep(poll_interval)
+        time.sleep(cfg.poll_interval)
 
 
 if __name__ == "__main__":
