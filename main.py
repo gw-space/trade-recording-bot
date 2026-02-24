@@ -53,6 +53,7 @@ class FillMessage:
 class FillResult:
     spreadsheet_title: str
     currency: str
+    current_round: str
     avg_price_r6: float
     current_price_b2: float
     buy_loc_avg_r9: float
@@ -314,13 +315,26 @@ def load_spreadsheet_id_map_from_file(path_text: str) -> Dict[str, str]:
 
 
 def get_fill_result_for_row(
-    ws: gspread.Worksheet, sh_title: str, target_row: int, total_qty_col: int, symbol_hint: str = ""
+    ws: gspread.Worksheet,
+    sh_title: str,
+    target_row: int,
+    total_qty_col: int,
+    progress_round_col: int,
+    symbol_hint: str = "",
 ) -> FillResult:
     sell_qty = get_numeric_cell_value_or_none(ws, f"{col_to_a1(total_qty_col)}{target_row}")
+    round_raw = ws.acell(f"{col_to_a1(progress_round_col)}{target_row}", value_render_option="UNFORMATTED_VALUE").value
+    if isinstance(round_raw, float) and round_raw.is_integer():
+        round_text = str(int(round_raw))
+    elif round_raw is None:
+        round_text = ""
+    else:
+        round_text = str(round_raw)
     ccy = currency_from_symbol(symbol_hint) if symbol_hint else detect_currency_by_sheet_title(sh_title)
     return FillResult(
         spreadsheet_title=sh_title,
         currency=ccy,
+        current_round=round_text,
         avg_price_r6=get_numeric_cell_value(ws, "R6"),
         current_price_b2=get_numeric_cell_value(ws, "B2"),
         buy_loc_avg_r9=get_numeric_cell_value(ws, "R9"),
@@ -334,6 +348,7 @@ def build_reply_text(result: FillResult) -> str:
     ccy = result.currency if result.currency else detect_currency_by_sheet_title(result.spreadsheet_title)
     return (
         f"구글스프레드시트({result.spreadsheet_title}) 기입 완료\n"
+        f"현재 진행회차 : {result.current_round}\n"
         f"현재 평단가 : {format_money(result.avg_price_r6, ccy)}\n"
         f"현재 주가 : {format_money(result.current_price_b2, ccy)}\n\n"
         f"오늘 매수 시도액\n"
@@ -575,6 +590,11 @@ def _is_total_qty_label(text: str) -> bool:
     return "총수량" in n
 
 
+def _is_progress_round_label(text: str) -> bool:
+    n = _norm_label(text)
+    return "진행회차" in n
+
+
 def find_header_row_and_columns(values: List[List[str]]) -> Tuple[int, int, int, int]:
     # returns: header_row(1-based), date_col, loc_avg_col, loc_high_col
     if not values:
@@ -653,6 +673,19 @@ def find_total_qty_column(values: List[List[str]], header_row: int, loc_high_col
     return loc_high_col + 4
 
 
+def find_progress_round_column(values: List[List[str]], header_row: int, date_col: int) -> int:
+    row_count = len(values)
+    for rr in [header_row, header_row - 1, header_row + 1]:
+        if rr < 1 or rr > row_count:
+            continue
+        row = values[rr - 1]
+        for c in range(1, len(row) + 1):
+            if _is_progress_round_label(row[c - 1]):
+                return c
+    # layout fallback: usually 바로 왼쪽
+    return max(1, date_col - 1)
+
+
 def find_or_create_date_row(
     ws: gspread.Worksheet,
     values: List[List[str]],
@@ -701,6 +734,7 @@ def process_fill_to_sheet(
     values = ws.get_all_values()
     header_row, date_col, loc_avg_col, loc_high_col = find_header_row_and_columns(values)
     total_qty_col = find_total_qty_column(values, header_row, loc_high_col)
+    progress_round_col = find_progress_round_column(values, header_row, date_col)
 
     year = datetime.now(ZoneInfo(tz_name)).year
     target_date = datetime(year, msg.fill_month, msg.fill_day).date()
@@ -709,22 +743,41 @@ def process_fill_to_sheet(
     target_row = find_or_create_date_row(ws, values, header_row, date_col, target_date, target_date_text)
 
     avg_price = get_numeric_cell_value(ws, "R6")
+    half_round_amount = get_numeric_cell_value(ws, "B3")
+    fill_amount = msg.fill_price * msg.fill_qty
+    ratio_full = fill_amount / (half_round_amount * 2) if half_round_amount > 0 else 0
 
-    if msg.fill_price <= avg_price:
-        price_col = loc_avg_col
+    if 0.8 <= ratio_full <= 1.2:
+        log(
+            f"sheet_write symbol={msg.symbol} row={target_row} "
+            f"mode=avg_with_zero_high fill_amount={fill_amount:.4f} ratio_full={ratio_full:.4f}"
+        )
+        ws.update(range_name=f"{col_to_a1(loc_avg_col)}{target_row}", values=[[msg.fill_price]])
+        ws.update(range_name=f"{col_to_a1(loc_avg_col + 1)}{target_row}", values=[[msg.fill_qty]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col)}{target_row}", values=[[0]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col + 1)}{target_row}", values=[[0]])
     else:
-        price_col = loc_high_col
-    qty_col = price_col + 1
+        if msg.fill_price <= avg_price:
+            price_col = loc_avg_col
+        else:
+            price_col = loc_high_col
+        qty_col = price_col + 1
 
-    target_zone = "LOC평단" if price_col == loc_avg_col else "LOC고가"
-    log(
-        f"sheet_write symbol={msg.symbol} row={target_row} "
-        f"zone={target_zone} price_col={col_to_a1(price_col)} qty_col={col_to_a1(qty_col)}"
+        target_zone = "LOC평단" if price_col == loc_avg_col else "LOC고가"
+        log(
+            f"sheet_write symbol={msg.symbol} row={target_row} "
+            f"zone={target_zone} price_col={col_to_a1(price_col)} qty_col={col_to_a1(qty_col)}"
+        )
+        ws.update(range_name=f"{col_to_a1(price_col)}{target_row}", values=[[msg.fill_price]])
+        ws.update(range_name=f"{col_to_a1(qty_col)}{target_row}", values=[[msg.fill_qty]])
+    return get_fill_result_for_row(
+        ws,
+        sh.title,
+        target_row,
+        total_qty_col,
+        progress_round_col,
+        msg.symbol,
     )
-
-    ws.update(range_name=f"{col_to_a1(price_col)}{target_row}", values=[[msg.fill_price]])
-    ws.update(range_name=f"{col_to_a1(qty_col)}{target_row}", values=[[msg.fill_qty]])
-    return get_fill_result_for_row(ws, sh.title, target_row, total_qty_col, msg.symbol)
 
 
 def process_upbit_fill_to_sheet(
@@ -746,6 +799,7 @@ def process_upbit_fill_to_sheet(
     values = ws.get_all_values()
     header_row, date_col, loc_avg_col, loc_high_col = find_header_row_and_columns(values)
     total_qty_col = find_total_qty_column(values, header_row, loc_high_col)
+    progress_round_col = find_progress_round_column(values, header_row, date_col)
 
     half_round_usd = get_numeric_cell_value(ws, "B3")
     avg_price = get_numeric_cell_value(ws, "R6")
@@ -760,15 +814,14 @@ def process_upbit_fill_to_sheet(
         target_date = fill.trade_time.date()
         target_date_text = target_date.strftime("%Y-%m-%d")
         target_row = find_or_create_date_row(ws, values, header_row, date_col, target_date, target_date_text)
-        half_qty = fill.qty / 2.0
         log(
-            f"upbit_sheet_write mode=both row={target_row} price={fill.price} qty_half={half_qty} "
+            f"upbit_sheet_write mode=avg_with_zero_high row={target_row} price={fill.price} qty={fill.qty} "
             f"ratio_full={ratio_full:.4f}"
         )
         ws.update(range_name=f"{col_to_a1(loc_avg_col)}{target_row}", values=[[fill.price]])
-        ws.update(range_name=f"{col_to_a1(loc_avg_col + 1)}{target_row}", values=[[half_qty]])
-        ws.update(range_name=f"{col_to_a1(loc_high_col)}{target_row}", values=[[fill.price]])
-        ws.update(range_name=f"{col_to_a1(loc_high_col + 1)}{target_row}", values=[[half_qty]])
+        ws.update(range_name=f"{col_to_a1(loc_avg_col + 1)}{target_row}", values=[[fill.qty]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col)}{target_row}", values=[[0]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col + 1)}{target_row}", values=[[0]])
     elif 0.8 <= ratio_half <= 1.2:
         target_date = fill.trade_time.date()
         target_date_text = target_date.strftime("%Y-%m-%d")
@@ -792,7 +845,14 @@ def process_upbit_fill_to_sheet(
         )
         return None
 
-    result = get_fill_result_for_row(ws, sh.title, target_row, total_qty_col, target_symbol)
+    result = get_fill_result_for_row(
+        ws,
+        sh.title,
+        target_row,
+        total_qty_col,
+        progress_round_col,
+        target_symbol,
+    )
     # Upbit sync in this bot assumes KRW market fills.
     result.currency = "KRW"
     return result
