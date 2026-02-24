@@ -58,7 +58,7 @@ GOOGLE_SERVICE_ACCOUNT_FILE=/Users/test/AIassistant/service_account.json
 ```
 7. 해당 JSON의 `client_email`을 복사해 대상 스프레드시트에 편집자 권한으로 공유
 
-## 3) 환경변수
+## 3) 환경변수(.env 파일 설정)
 
 필수:
 - `GOOGLE_SERVICE_ACCOUNT_FILE`
