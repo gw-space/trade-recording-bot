@@ -712,6 +712,10 @@ def find_or_create_date_row(
         r_idx += 1
 
 
+def is_blank_cell(value) -> bool:
+    return str(value or "").strip() == ""
+
+
 def process_fill_to_sheet(
     gc: gspread.Client,
     msg: FillMessage,
@@ -761,6 +765,13 @@ def process_fill_to_sheet(
             price_col = loc_avg_col
         else:
             price_col = loc_high_col
+        # Same-date fallback rule:
+        # If LOC평단 already has a value and LOC고가 is empty, write this buy into LOC고가.
+        if price_col == loc_avg_col:
+            avg_existing = ws.acell(f"{col_to_a1(loc_avg_col)}{target_row}").value
+            high_existing = ws.acell(f"{col_to_a1(loc_high_col)}{target_row}").value
+            if (not is_blank_cell(avg_existing)) and is_blank_cell(high_existing):
+                price_col = loc_high_col
         qty_col = price_col + 1
 
         target_zone = "LOC평단" if price_col == loc_avg_col else "LOC고가"
