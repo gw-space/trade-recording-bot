@@ -92,6 +92,7 @@ class AppConfig:
     upbit_command_prefix: str
     backup_dir: str
     spreadsheet_id_map: Dict[str, str]
+    result_spreadsheet_id: str
 
 
 @dataclass
@@ -375,6 +376,14 @@ def build_upbit_command_result_text(processed_count: int, written_count: int, re
     )
 
 
+def parse_sell_complete_message(text: str) -> Optional[str]:
+    """Parse 'SYMBOL 매도 완료' message. Returns symbol or None."""
+    m = re.match(r"^\s*([A-Za-z0-9_-]+)\s+매도\s*완료\s*$", text.strip())
+    if not m:
+        return None
+    return m.group(1).strip().upper()
+
+
 def parse_upbit_symbol_command(
     text: str,
     command_prefix: str,
@@ -534,6 +543,111 @@ def resolve_spreadsheet(gc: gspread.Client, symbol: str, spreadsheet_id_map: Dic
     raise ValueError(
         f"스프레드시트 매핑에 {symbol} 키가 없습니다. "
         "SPREADSHEET_ID_MAP 또는 SPREADSHEET_ID_MAP_FILE(JSON) 설정을 확인하세요."
+    )
+
+
+def process_sell_complete(
+    gc: gspread.Client,
+    symbol: str,
+    worksheet_name: str,
+    spreadsheet_id_map: Dict[str, str],
+    result_spreadsheet_id: str,
+    backup_dir: str,
+    backup_cache: set,
+    backup_context: str,
+) -> str:
+    """Read summary from 무한매수 sheet and write to 결과표 spreadsheet.
+
+    Returns a reply message string.
+    """
+    if not result_spreadsheet_id:
+        raise ValueError("RESULT_SPREADSHEET_ID 가 설정되지 않았습니다.")
+
+    # 1) 무한매수 시트 열기 & 요약 데이터 읽기
+    sh = resolve_spreadsheet(gc, symbol, spreadsheet_id_map)
+    ensure_spreadsheet_backup_once(sh, backup_dir, backup_cache, backup_context, symbol)
+    ws = sh.worksheet(worksheet_name) if worksheet_name else sh.get_worksheet(0)
+
+    values = ws.get_all_values()
+    header_row, date_col, loc_avg_col, loc_high_col = find_header_row_and_columns(values)
+    total_qty_col = find_total_qty_column(values, header_row, loc_high_col)
+
+    # R11 = 지정가매도 가격
+    sell_price_r11 = get_numeric_cell_value(ws, "R11")
+
+    # 총투자금 (H55) — 투자금 컬럼의 요약행
+    # 투자금 컬럼 = loc_high_col + 2 (H열, 레이아웃: D=LOC평단, E=수량, F=LOC고가, G=수량, H=투자금)
+    invest_col = loc_high_col + 2
+    # 총수량 컬럼 (J열)
+    # 요약행 찾기: 데이터 행(header_row+1 ~ header_row+40) 이후 첫 요약행
+    summary_row = header_row + 40 + 1  # row 55 기준 (header 14 + 40 + 1 = 55)
+
+    total_investment = get_numeric_cell_value(ws, f"{col_to_a1(invest_col)}{summary_row}")
+    total_qty = get_numeric_cell_value(ws, f"{col_to_a1(total_qty_col)}{summary_row}")
+
+    # 총판매금액 = R11(지정가매도) × 마지막줄 총수량
+    total_sell_amount = sell_price_r11 * total_qty
+    # 수익 = 총판매금액 - 총매수금액
+    profit = total_sell_amount - total_investment
+
+    # 기간: 데이터 행에서 첫 날짜 ~ 마지막 날짜
+    first_date = None
+    last_date = None
+    for r_idx in range(header_row + 1, len(values) + 1):
+        row = values[r_idx - 1]
+        raw = row[date_col - 1] if len(row) >= date_col else ""
+        parsed = normalize_date_value(raw)
+        if parsed:
+            if first_date is None:
+                first_date = parsed
+            last_date = parsed
+
+    if first_date and last_date:
+        period_str = f"{first_date.strftime('%y.%m.%d')}~{last_date.strftime('%y.%m.%d')}"
+    else:
+        period_str = ""
+
+    # 2) 결과표 스프레드시트에 기록
+    result_sh = gc.open_by_key(result_spreadsheet_id)
+    result_ws = result_sh.get_worksheet(0)
+    result_values = result_ws.get_all_values()
+
+    # 다음 빈 행 찾기 (A열 기준)
+    next_row = len(result_values) + 1
+    # 회차 = 데이터 행 수 (헤더 제외)
+    round_num = max(1, next_row - 1)
+
+    ccy = currency_from_symbol(symbol)
+
+    result_ws.update(
+        range_name=f"A{next_row}:F{next_row}",
+        values=[[
+            round_num,
+            period_str,
+            format_money(total_investment, ccy),
+            format_money(total_sell_amount, ccy),
+            format_money(profit, ccy),
+            symbol,
+        ]],
+    )
+    result_ws.format(f"A{next_row}:F{next_row}", {
+        "horizontalAlignment": "CENTER",
+        "verticalAlignment": "MIDDLE",
+    })
+
+    log(
+        f"sell_complete symbol={symbol} round={round_num} "
+        f"period={period_str} investment={total_investment} "
+        f"sell_amount={total_sell_amount} profit={profit}"
+    )
+
+    return (
+        f"{symbol} 매도 완료 → 결과표 기록 완료\n"
+        f"회차: {round_num}\n"
+        f"기간: {period_str}\n"
+        f"총매수금액: {format_money(total_investment, ccy)}\n"
+        f"총판매금액: {format_money(total_sell_amount, ccy)}\n"
+        f"수익: {format_money(profit, ccy)}"
     )
 
 
@@ -746,12 +860,21 @@ def process_fill_to_sheet(
 
     target_row = find_or_create_date_row(ws, values, header_row, date_col, target_date, target_date_text)
 
-    avg_price = get_numeric_cell_value(ws, "R6")
+    avg_price = get_numeric_cell_value_or_none(ws, "R6")
     half_round_amount = get_numeric_cell_value(ws, "B3")
     fill_amount = msg.fill_price * msg.fill_qty
     ratio_full = fill_amount / (half_round_amount * 2) if half_round_amount > 0 else 0
 
-    if 0.8 <= ratio_full <= 1.2:
+    if avg_price is None:
+        # 1회차 등 평단가가 아직 없는 경우 비교 없이 LOC평단에 기록, LOC고가 수량=0
+        log(
+            f"sheet_write symbol={msg.symbol} row={target_row} "
+            f"mode=avg_no_r6 (R6 empty → LOC평단 + LOC고가 qty=0)"
+        )
+        ws.update(range_name=f"{col_to_a1(loc_avg_col)}{target_row}", values=[[msg.fill_price]])
+        ws.update(range_name=f"{col_to_a1(loc_avg_col + 1)}{target_row}", values=[[msg.fill_qty]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col + 1)}{target_row}", values=[[0]])
+    elif 0.8 <= ratio_full <= 1.2:
         log(
             f"sheet_write symbol={msg.symbol} row={target_row} "
             f"mode=avg_with_zero_high fill_amount={fill_amount:.4f} ratio_full={ratio_full:.4f}"
@@ -813,7 +936,7 @@ def process_upbit_fill_to_sheet(
     progress_round_col = find_progress_round_column(values, header_row, date_col)
 
     half_round_usd = get_numeric_cell_value(ws, "B3")
-    avg_price = get_numeric_cell_value(ws, "R6")
+    avg_price = get_numeric_cell_value_or_none(ws, "R6")
     ratio_half = fill.amount / half_round_usd if half_round_usd > 0 else 0
     ratio_full = fill.amount / (half_round_usd * 2) if half_round_usd > 0 else 0
     log(
@@ -821,7 +944,19 @@ def process_upbit_fill_to_sheet(
         f"b3={half_round_usd:.4f} ratio_half={ratio_half:.4f} ratio_full={ratio_full:.4f}"
     )
 
-    if 0.8 <= ratio_full <= 1.2:
+    if avg_price is None:
+        # 1회차 등 평단가가 아직 없는 경우 비교 없이 LOC평단에 기록, LOC고가 수량=0
+        target_date = fill.trade_time.date()
+        target_date_text = target_date.strftime("%Y-%m-%d")
+        target_row = find_or_create_date_row(ws, values, header_row, date_col, target_date, target_date_text)
+        log(
+            f"upbit_sheet_write mode=avg_no_r6 row={target_row} price={fill.price} qty={fill.qty} "
+            f"(R6 empty → LOC평단 + LOC고가 qty=0)"
+        )
+        ws.update(range_name=f"{col_to_a1(loc_avg_col)}{target_row}", values=[[fill.price]])
+        ws.update(range_name=f"{col_to_a1(loc_avg_col + 1)}{target_row}", values=[[fill.qty]])
+        ws.update(range_name=f"{col_to_a1(loc_high_col + 1)}{target_row}", values=[[0]])
+    elif 0.8 <= ratio_full <= 1.2:
         target_date = fill.trade_time.date()
         target_date_text = target_date.strftime("%Y-%m-%d")
         target_row = find_or_create_date_row(ws, values, header_row, date_col, target_date, target_date_text)
@@ -1007,6 +1142,7 @@ def build_app_config() -> AppConfig:
     upbit_orders_path = os.getenv("UPBIT_ORDERS_PATH", "/v1/orders").strip()
     upbit_command_prefix = os.getenv("UPBIT_COMMAND_PREFIX", "업비트").strip()
     backup_dir = os.getenv("SPREADSHEET_BACKUP_DIR", "/Users/test/AIassistant/spreadsheet_backups").strip()
+    result_spreadsheet_id = os.getenv("RESULT_SPREADSHEET_ID", "").strip()
     spreadsheet_id_map = parse_spreadsheet_id_map(os.getenv("SPREADSHEET_ID_MAP", "").strip())
     spreadsheet_id_map_file = os.getenv("SPREADSHEET_ID_MAP_FILE", "").strip()
     if spreadsheet_id_map_file:
@@ -1030,6 +1166,7 @@ def build_app_config() -> AppConfig:
         upbit_command_prefix=upbit_command_prefix,
         backup_dir=backup_dir,
         spreadsheet_id_map=spreadsheet_id_map,
+        result_spreadsheet_id=result_spreadsheet_id,
     )
 
 
@@ -1129,9 +1266,48 @@ def handle_meritz_message_strategy(ctx: UpdateContext) -> bool:
     return True
 
 
+def handle_sell_complete_strategy(ctx: UpdateContext) -> bool:
+    symbol = parse_sell_complete_message(ctx.text)
+    if not symbol:
+        return False
+    log(f"sell_complete_parsed update_id={ctx.update_id} symbol={symbol}")
+    if not ctx.cfg.result_spreadsheet_id:
+        log("sell_complete_ignored: RESULT_SPREADSHEET_ID not configured")
+        if ctx.chat_id is not None:
+            send_telegram_message(
+                ctx.cfg.token,
+                ctx.chat_id,
+                "결과표 스프레드시트 ID가 설정되지 않았습니다. RESULT_SPREADSHEET_ID를 설정하세요.",
+            )
+        return True
+    try:
+        reply = process_sell_complete(
+            gc=ctx.gc,
+            symbol=symbol,
+            worksheet_name=ctx.cfg.worksheet_name,
+            spreadsheet_id_map=ctx.cfg.spreadsheet_id_map,
+            result_spreadsheet_id=ctx.cfg.result_spreadsheet_id,
+            backup_dir=ctx.cfg.backup_dir,
+            backup_cache=ctx.backup_cache,
+            backup_context=f"sell_complete_{ctx.update_id}",
+        )
+    except Exception as e:
+        log(f"sell_complete_error symbol={symbol}: {e}")
+        if ctx.chat_id is not None:
+            send_telegram_message(
+                ctx.cfg.token,
+                ctx.chat_id,
+                f"{symbol} 매도 완료 결과표 기록 실패: {e}",
+            )
+        return True
+    if ctx.chat_id is not None:
+        send_telegram_message(ctx.cfg.token, ctx.chat_id, reply)
+    return True
+
+
 def build_strategies() -> List[StrategyHandler]:
     # First-match-wins pipeline. Add new asset handlers here.
-    return [handle_upbit_command_strategy, handle_meritz_message_strategy]
+    return [handle_sell_complete_strategy, handle_upbit_command_strategy, handle_meritz_message_strategy]
 
 
 def dispatch_update(ctx: UpdateContext, strategies: List[StrategyHandler]) -> bool:
