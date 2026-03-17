@@ -5,15 +5,6 @@
 
 이 프로그램은 텔레그램 메시지를 입력으로 받아 체결 정보를 시트에 기록하고, 결과를 텔레그램으로 회신하며, 오늘 진행해야할 매수금액과 매도금액을 알려줍니다.
 
-초기 스프레드시트 준비(먼저 수행):
-1. 기본 템플릿(`spreadsheet_template.xlsx`)을 Google 스프레드시트로 업로드
-2. 업로드된 스프레드시트를 서비스 계정 `client_email`에 **편집자** 권한으로 공유 (**필수**)
-3. 셀 `B1`에 종목명 입력
-4. 셀 `B4`에 원금 입력
-5. `.env`의 스프레드시트 매핑(`SPREADSHEET_ID_MAP` 또는 `SPREADSHEET_ID_MAP_FILE`)에 종목:시트ID 추가
-
-> ⚠️ **중요**: `service_account.json`은 인증(Authentication)만 담당합니다. 스프레드시트에 실제로 접근하려면 반드시 해당 스프레드시트를 서비스 계정 이메일에 **편집자 권한으로 공유**해야 합니다. 공유하지 않으면 403 권한 오류가 발생합니다. 무한매수 시트, 결과표 시트 등 **봇이 접근하는 모든 스프레드시트**에 동일하게 적용됩니다.
-
 ## 1) 주요 기능
 
 - 메리츠 체결 안내 메시지 파싱 후 시트 자동 기입
@@ -35,16 +26,20 @@ pip install -r requirements.txt
 2. Google 서비스 계정
 - `service_account.json` 준비 (아래 상세 방법 참고)
 - `.env`의 `GOOGLE_SERVICE_ACCOUNT_FILE` 설정
-- **봇이 접근하는 모든 스프레드시트**를 서비스계정 `client_email`에 `편집자` 권한으로 공유
-  - 무한매수 시트 (종목별 각각)
-  - 결과표 스프레드시트 (`RESULT_SPREADSHEET_ID`)
-  - `service_account.json`만으로는 스프레드시트에 접근할 수 없음 (403 오류 발생)
 
-3. 업비트 API (업비트 루틴 사용 시)
+3. 스프레드시트 준비 (종목 추가 시마다 반복)
+- 기본 템플릿(`spreadsheet_template.xlsx`)을 Google 스프레드시트로 업로드
+- 업로드된 스프레드시트를 서비스 계정 `client_email`에 **편집자** 권한으로 공유 (**필수**)
+- 셀 `B1`에 종목명 입력, 셀 `B4`에 원금 입력
+- `.env`의 스프레드시트 매핑(`SPREADSHEET_ID_MAP` 또는 `SPREADSHEET_ID_MAP_FILE`)에 종목:시트ID 추가
+
+> ⚠️ **중요**: `service_account.json`은 인증(Authentication)만 담당합니다. 스프레드시트에 실제로 접근하려면 반드시 해당 스프레드시트를 서비스 계정 이메일에 **편집자 권한으로 공유**해야 합니다. 공유하지 않으면 403 권한 오류가 발생합니다. 무한매수 시트, 결과표 시트 등 **봇이 접근하는 모든 스프레드시트**에 동일하게 적용됩니다.
+
+4. 업비트 API (업비트 루틴 사용 시)
 - Access Key / Secret Key 발급
 - 허용 IP 등록
 
-4. 텔레그램 봇 (필수)
+5. 텔레그램 봇 (필수)
 - Telegram에서 `@BotFather` 실행
 - `/newbot`으로 봇 생성 후 토큰 발급
 - 발급 토큰을 `.env`의 `TELEGRAM_BOT_TOKEN`에 설정
